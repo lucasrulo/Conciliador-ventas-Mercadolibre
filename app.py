@@ -51,23 +51,48 @@ file_sap = st.sidebar.file_uploader("3. Reporte SAP", type=["xlsx", "xls"])
 if file_meli and file_mp and file_sap:
     with st.spinner("Procesando y cruzando los datos..."):
         try:
-            # 1. LEER ARCHIVOS
+            # 1. LEER ARCHIVOS EN BRUTO
             df_meli_raw = pd.read_excel(file_meli)
             df_mp_raw = pd.read_excel(file_mp)
             df_sap_raw = pd.read_excel(file_sap)
 
+            # --- CORRECCIÓN DINÁMICA DE ENCABEZADOS (Salto de filas vacías o banners) ---
+            # Buscar la fila real de Mercado Libre
+            if '# de venta' not in [str(c).strip() for c in df_meli_raw.columns]:
+                for i in range(1, 15):
+                    df_try = pd.read_excel(file_meli, header=i)
+                    if any('# de venta' in str(c) for c in df_try.columns):
+                        df_meli_raw = df_try
+                        break
+
+            # Buscar la fila real de Mercado Pago
+            col_mp_ref_target = 'Código de referencia (external_reference)'
+            if col_mp_ref_target not in [str(c).strip() for c in df_mp_raw.columns]:
+                for i in range(1, 15):
+                    df_try = pd.read_excel(file_mp, header=i)
+                    if any(col_mp_ref_target in str(c) for c in df_try.columns):
+                        df_mp_raw = df_try
+                        break
+
+            # Buscar la fila real de SAP
+            col_sap_target = 'Pedido VTEX o marca'
+            if col_sap_target not in [str(c).strip() for c in df_sap_raw.columns]:
+                for i in range(1, 15):
+                    df_try = pd.read_excel(file_sap, header=i)
+                    if any(col_sap_target in str(c) for c in df_try.columns):
+                        df_sap_raw = df_try
+                        break
+
             # --- PROCESAMIENTO MERCADO LIBRE ---
             df_meli = df_meli_raw.copy()
-            # Asegurar nombres de columnas limpios
             df_meli.columns = [str(c).strip() for c in df_meli.columns]
             
-            # Identificar columnas clave
             col_meli_id = '# de venta'
             col_meli_fecha = 'Fecha de venta'
             col_meli_monto = 'Ingresos por productos (ARS)'
             
             df_meli['Pack_ID_Clean'] = df_meli[col_meli_id].astype(str).str.strip()
-            df_meli['Fecha_Clean'] = pd.to_datetime(df_meli[col_meli_fecha]).dt.date
+            df_meli['Fecha_Clean'] = pd.to_datetime(df_meli[col_meli_fecha], errors='coerce').dt.date
             df_meli['Monto_MELI'] = pd.to_numeric(df_meli[col_meli_monto], errors='coerce').fillna(0)
 
             # --- PROCESAMIENTO MERCADO PAGO ---
@@ -80,9 +105,8 @@ if file_meli and file_mp and file_sap:
             
             df_mp['Ext_Ref_Clean'] = df_mp[col_mp_ref].astype(str).str.strip()
             df_mp['Order_ID_Clean'] = df_mp[col_mp_order].astype(str).str.strip()
-            df_mp['Fecha_Clean'] = pd.to_datetime(df_mp[col_mp_fecha]).dt.date
+            df_mp['Fecha_Clean'] = pd.to_datetime(df_mp[col_mp_fecha], errors='coerce').dt.date
             
-            # Buscar columna de monto (adaptable si cambia el nombre exacto de la columna de dinero neta)
             col_mp_monto = [c for c in df_mp.columns if 'monto' in c.lower() or 'importe' in c.lower() or 'neto' in c.lower() or 'total' in c.lower()]
             col_mp_monto = col_mp_monto[0] if col_mp_monto else df_mp.columns[len(df_mp.columns)-1] 
             df_mp['Monto_MP'] = pd.to_numeric(df_mp[col_mp_monto], errors='coerce').fillna(0)
@@ -95,7 +119,6 @@ if file_meli and file_mp and file_sap:
             col_sap_cuenta = 'Cta.efectivo'
             col_sap_fecha = 'Fecha de contabilización'
             
-            # Buscar columna de monto en SAP
             col_sap_monto = [c for c in df_sap.columns if 'importe' in c.lower() or 'monto' in c.lower() or 'saldo' in c.lower() or 'total' in c.lower()]
             col_sap_monto = col_sap_monto[0] if col_sap_monto else df_sap.columns[len(df_sap.columns)-1]
 
@@ -103,35 +126,25 @@ if file_meli and file_mp and file_sap:
             df_sap['Marca_Texto_SAP'] = df_sap[col_sap_vtex].apply(detectar_marca_sap_texto)
             df_sap['Cuenta_Clean'] = df_sap[col_sap_cuenta].astype(str).str.strip()
             df_sap['Marca_Cuenta_SAP'] = df_sap['Cuenta_Clean'].map(BRAND_ACCOUNTS).fillna("OTRA / DESCONOCIDA")
-            df_sap['Fecha_Clean'] = pd.to_datetime(df_sap[col_sap_fecha]).dt.date
+            df_sap['Fecha_Clean'] = pd.to_datetime(df_sap[col_sap_fecha], errors='coerce').dt.date
             df_sap['Monto_SAP'] = pd.to_numeric(df_sap[col_sap_monto], errors='coerce').fillna(0)
 
             # -----------------------------------------------------------------
-            # LÓGICA DE CONCILIACIÓN (Cruces robustos)
+            # LÓGICA DE CONCILIACIÓN
             # -----------------------------------------------------------------
-            
-            # Como MP viene abierto por Order ID y SAP/MELI consolidan en Pack ID,
-            # usaremos los datos disponibles para mapear Order ID -> Pack ID.
-            # En muchos casos, si external_reference o el mapeo interno coincide, agrupamos MP.
-            
-            # Agrupamos MP por el external_reference (que suele agrupar o mapearse al Pack)
-            # Si external_reference no coincide con Pack ID directo, creamos un consolidado por Ext_Ref_Clean
             mp_grouped = df_mp.groupby('Ext_Ref_Clean').agg({
                 'Monto_MP': 'sum',
                 'Fecha_Clean': 'first',
                 'Order_ID_Clean': lambda x: ", ".join(x.unique())
             }).reset_index()
             
-            # Cambiamos nombre para cruzar con el Pack ID maestro
             mp_grouped.rename(columns={'Ext_Ref_Clean': 'Pack_ID_Clean'}, inplace=True)
 
-            # Agrupamos MELI por Pack ID por si hubiera líneas duplicadas
             meli_grouped = df_meli.groupby('Pack_ID_Clean').agg({
                 'Monto_MELI': 'sum',
                 'Fecha_Clean': 'first'
             }).reset_index()
 
-            # Agrupamos SAP por Pack ID
             sap_grouped = df_sap.groupby('Pack_ID_Clean').agg({
                 'Monto_SAP': 'sum',
                 'Fecha_Clean': 'first',
@@ -140,42 +153,34 @@ if file_meli and file_mp and file_sap:
                 'Marca_Cuenta_SAP': 'first'
             }).reset_index()
 
-            # UNIVERSO TOTAL DE PACK IDs
             all_packs = set(meli_grouped['Pack_ID_Clean']).union(set(mp_grouped['Pack_ID_Clean'])).union(set(sap_grouped['Pack_ID_Clean']))
             df_master = pd.DataFrame({'Pack_ID_Clean': list(all_packs)})
 
-            # MERGE MAESTRO
             df_master = df_master.merge(meli_grouped, on='Pack_ID_Clean', how='left')
             df_master = df_master.merge(mp_grouped, on='Pack_ID_Clean', how='left', suffixes=('_MELI', '_MP'))
             df_master = df_master.merge(sap_grouped, on='Pack_ID_Clean', how='left')
             df_master.rename(columns={'Fecha_Clean': 'Fecha_SAP'}, inplace=True)
 
             # -----------------------------------------------------------------
-            # VALIDACIONES REQUERIDAS
+            # VALIDACIONES
             # -----------------------------------------------------------------
-            
-            # 1. Falta PR en SAP
             df_master['Falta_En_SAP'] = df_master['Monto_SAP'].isna() | (df_master['Monto_SAP'] == 0)
             
-            # 2. Diferencias de montos
             df_master['Diff_MELI_MP'] = (df_master['Monto_MELI'].fillna(0) - df_master['Monto_MP'].fillna(0)).round(2)
             df_master['Diff_MP_SAP'] = (df_master['Monto_MP'].fillna(0) - df_master['Monto_SAP'].fillna(0)).round(2)
             df_master['Tiene_Diff_Monto'] = (df_master['Diff_MELI_MP'] != 0) | (df_master['Diff_MP_SAP'] != 0)
 
-            # 3. Mismas fechas migradas
             def verificar_fechas(row):
                 fechas = []
                 if not pd.isna(row['Fecha_Clean_MELI']): fechas.append(row['Fecha_Clean_MELI'])
                 if not pd.isna(row['Fecha_Clean_MP']): fechas.append(row['Fecha_Clean_MP'])
                 if not pd.isna(row['Fecha_SAP']): fechas.append(row['Fecha_SAP'])
-                
                 if len(set(fechas)) > 1:
                     return "Descalce de Fecha"
                 return "OK"
 
             df_master['Control_Fecha'] = df_master.apply(verificar_fechas, axis=1)
 
-            # 4. Cuenta de marca correspondiente en SAP
             def verificar_marca(row):
                 if pd.isna(row['Monto_SAP']) or row['Monto_SAP'] == 0:
                     return "Sin Registro en SAP"
@@ -187,25 +192,19 @@ if file_meli and file_mp and file_sap:
 
             df_master['Control_Marca_SAP'] = df_master.apply(verificar_marca, axis=1)
 
-            # 5. Pagos Duplicados
-            # Detectar si un Pack ID aparece repetido en los reportes base antes de agrupar
             dup_meli = df_meli_raw[df_meli_raw.duplicated(subset=[col_meli_id], keep=False)]
-            # Para MP excluimos las aperturas normales por producto buscando si repite mismo order_id con mismo item_id de forma idéntica
             dup_mp = df_mp_raw[df_mp_raw.duplicated(subset=[col_mp_order, 'Identificador de producto (item_id)'], keep=False)] if 'Identificador de producto (item_id)' in df_mp_raw.columns else pd.DataFrame()
             dup_sap = df_sap_raw[df_sap_raw.duplicated(subset=[col_sap_vtex], keep=False)]
 
             # -----------------------------------------------------------------
             # VISUALIZACIÓN EN STREAMLIT
             # -----------------------------------------------------------------
-            
-            # Indicadores Clave (KPIs)
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total Packs Analizados", len(df_master))
             c2.metric("Faltantes en SAP (PR)", df_master['Falta_En_SAP'].sum())
             c3.metric("Diferencias de Monto", df_master['Tiene_Diff_Monto'].sum())
             c4.metric("Errores de Imputación/Marca", (df_master['Control_Marca_SAP'].str.contains("Error")).sum())
 
-            # Separación por Pestañas
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "🔍 Todo el Universo", 
                 "⚠️ Faltantes en SAP", 
@@ -247,7 +246,7 @@ if file_meli and file_mp and file_sap:
 
             with tab5:
                 st.subheader("Alertas de Fechas Descalzadas")
-                df_fechas_err = df_master[df_master['Control_Control_Fecha'] == "Descalce de Fecha" if 'Control_Control_Fecha' in df_master else df_master['Control_Fecha'] == "Descalce de Fecha"]
+                df_fechas_err = df_master[df_master['Control_Fecha'] == "Descalce de Fecha"]
                 if not df_fechas_err.empty:
                     st.dataframe(df_fechas_err[['Pack_ID_Clean', 'Fecha_Clean_MELI', 'Fecha_Clean_MP', 'Fecha_SAP']])
                 else:
