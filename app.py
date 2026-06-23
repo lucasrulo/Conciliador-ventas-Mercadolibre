@@ -27,7 +27,6 @@ def extraer_pack_id_sap(v):
     if pd.isna(v):
         return None
     v_str = str(v).strip()
-    # Busca la secuencia de números al final de la cadena (ej. MELI_REEBOK2000013588172475)
     match = re.search(r'\d+$', v_str)
     return match.group(0) if match else v_str
 
@@ -56,32 +55,28 @@ if file_meli and file_mp and file_sap:
             df_mp_raw = pd.read_excel(file_mp)
             df_sap_raw = pd.read_excel(file_sap)
 
-            # --- CORRECCIÓN DINÁMICA DE ENCABEZADOS (Salto de filas vacías o banners) ---
-            # Buscar la fila real de Mercado Libre
-            if '# de venta' not in [str(c).strip() for c in df_meli_raw.columns]:
-                for i in range(1, 15):
-                    df_try = pd.read_excel(file_meli, header=i)
-                    if any('# de venta' in str(c) for c in df_try.columns):
-                        df_meli_raw = df_try
-                        break
+            # --- CORRECCIÓN DINÁMICA DE ENCABEZADOS A PRUEBA DE ARCHIVOS PEQUEÑOS ---
+            def corregir_encabezados(df, col_objetivo):
+                cols_actuales = [str(c).strip() for c in df.columns]
+                
+                # Verifica si la columna ya está correctamente en los encabezados principales
+                if any(col_objetivo in c for c in cols_actuales):
+                    df.columns = cols_actuales
+                    return df
+                
+                # Busca en las primeras 15 filas de los datos leídos
+                for idx, row in df.head(15).iterrows():
+                    valores_fila = [str(x).strip() for x in row.values]
+                    if any(col_objetivo in v for v in valores_fila):
+                        df.columns = valores_fila # Asigna la fila correcta como encabezados
+                        return df.iloc[idx + 1:].reset_index(drop=True) # Borra todo lo que está arriba
+                
+                return df # Si no lo encuentra, devuelve el archivo tal cual
 
-            # Buscar la fila real de Mercado Pago
-            col_mp_ref_target = 'Código de referencia (external_reference)'
-            if col_mp_ref_target not in [str(c).strip() for c in df_mp_raw.columns]:
-                for i in range(1, 15):
-                    df_try = pd.read_excel(file_mp, header=i)
-                    if any(col_mp_ref_target in str(c) for c in df_try.columns):
-                        df_mp_raw = df_try
-                        break
-
-            # Buscar la fila real de SAP
-            col_sap_target = 'Pedido VTEX o marca'
-            if col_sap_target not in [str(c).strip() for c in df_sap_raw.columns]:
-                for i in range(1, 15):
-                    df_try = pd.read_excel(file_sap, header=i)
-                    if any(col_sap_target in str(c) for c in df_try.columns):
-                        df_sap_raw = df_try
-                        break
+            # Aplicar la corrección a los 3 archivos
+            df_meli_raw = corregir_encabezados(df_meli_raw, '# de venta')
+            df_mp_raw = corregir_encabezados(df_mp_raw, 'Código de referencia (external_reference)')
+            df_sap_raw = corregir_encabezados(df_sap_raw, 'Pedido VTEX o marca')
 
             # --- PROCESAMIENTO MERCADO LIBRE ---
             df_meli = df_meli_raw.copy()
