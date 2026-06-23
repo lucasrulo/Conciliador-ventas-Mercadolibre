@@ -27,7 +27,6 @@ def extraer_pack_id_sap(v):
     if pd.isna(v):
         return None
     v_str = str(v).strip()
-    # Busca la secuencia de números al final de la cadena (ej. MELI_REEBOK2000013588172475)
     match = re.search(r'\d+$', v_str)
     return match.group(0) if match else v_str
 
@@ -52,20 +51,16 @@ def parsear_fecha_espanol(fecha_str):
         'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12'
     }
     
-    # Reemplazar ' de mes de ' por '/mes_num/'
     for mes_es, mes_num in meses.items():
         if f" de {mes_es} de " in fecha_str:
             fecha_str = fecha_str.replace(f" de {mes_es} de ", f"/{mes_num}/")
             break
             
-    # Limpiar ' hs.' o ' hs'
     fecha_str = fecha_str.replace(" hs.", "").replace(" hs", "").strip()
     
     try:
-        # Intenta parsear el formato resultante DD/MM/YYYY HH:MM
         return pd.to_datetime(fecha_str, format='%d/%m/%Y %H:%M')
     except:
-        # Si falla, intenta que Pandas lo adivine de forma genérica sin colapsar
         return pd.to_datetime(fecha_str, errors='coerce')
 
 # -----------------------------------------------------------------------------
@@ -84,19 +79,37 @@ if file_meli and file_mp and file_sap:
             df_mp_raw = pd.read_excel(file_mp)
             df_sap_raw = pd.read_excel(file_sap)
 
+            # --- CORRECCIÓN DINÁMICA DE ENCABEZADOS ---
+            # Esta función busca la tabla real ignorando los títulos de arriba
+            def corregir_encabezados(df, col_objetivo):
+                cols_actuales = [str(c).strip() for c in df.columns]
+                
+                if any(col_objetivo in c for c in cols_actuales):
+                    df.columns = cols_actuales
+                    return df
+                
+                for idx, row in df.head(15).iterrows():
+                    valores_fila = [str(x).strip() for x in row.values]
+                    if any(col_objetivo in v for v in valores_fila):
+                        df.columns = valores_fila
+                        return df.iloc[idx + 1:].reset_index(drop=True)
+                
+                return df 
+
+            # Aplicar limpieza de encabezados a los 3 archivos
+            df_meli_raw = corregir_encabezados(df_meli_raw, '# de venta')
+            df_mp_raw = corregir_encabezados(df_mp_raw, 'Código de referencia (external_reference)')
+            df_sap_raw = corregir_encabezados(df_sap_raw, 'Pedido VTEX o marca')
+
             # --- PROCESAMIENTO MERCADO LIBRE ---
             df_meli = df_meli_raw.copy()
-            # Asegurar nombres de columnas limpios
             df_meli.columns = [str(c).strip() for c in df_meli.columns]
             
-            # Identificar columnas clave
             col_meli_id = '# de venta'
             col_meli_fecha = 'Fecha de venta'
             col_meli_monto = 'Ingresos por productos (ARS)'
             
             df_meli['Pack_ID_Clean'] = df_meli[col_meli_id].astype(str).str.strip()
-            
-            # Usar la nueva función para convertir el texto en español a fecha real
             df_meli['Fecha_Clean'] = df_meli[col_meli_fecha].apply(parsear_fecha_espanol).dt.date
             df_meli['Monto_MELI'] = pd.to_numeric(df_meli[col_meli_monto], errors='coerce').fillna(0)
 
@@ -110,11 +123,8 @@ if file_meli and file_mp and file_sap:
             
             df_mp['Ext_Ref_Clean'] = df_mp[col_mp_ref].astype(str).str.strip()
             df_mp['Order_ID_Clean'] = df_mp[col_mp_order].astype(str).str.strip()
-            
-            # errors='coerce' evita que el programa se rompa si hay una fecha mal escrita
             df_mp['Fecha_Clean'] = pd.to_datetime(df_mp[col_mp_fecha], errors='coerce').dt.date
             
-            # Buscar columna de monto (adaptable si cambia el nombre exacto de la columna de dinero neta)
             col_mp_monto = [c for c in df_mp.columns if 'monto' in c.lower() or 'importe' in c.lower() or 'neto' in c.lower() or 'total' in c.lower()]
             col_mp_monto = col_mp_monto[0] if col_mp_monto else df_mp.columns[len(df_mp.columns)-1] 
             df_mp['Monto_MP'] = pd.to_numeric(df_mp[col_mp_monto], errors='coerce').fillna(0)
@@ -127,7 +137,6 @@ if file_meli and file_mp and file_sap:
             col_sap_cuenta = 'Cta.efectivo'
             col_sap_fecha = 'Fecha de contabilización'
             
-            # Buscar columna de monto en SAP
             col_sap_monto = [c for c in df_sap.columns if 'importe' in c.lower() or 'monto' in c.lower() or 'saldo' in c.lower() or 'total' in c.lower()]
             col_sap_monto = col_sap_monto[0] if col_sap_monto else df_sap.columns[len(df_sap.columns)-1]
 
@@ -135,15 +144,12 @@ if file_meli and file_mp and file_sap:
             df_sap['Marca_Texto_SAP'] = df_sap[col_sap_vtex].apply(detectar_marca_sap_texto)
             df_sap['Cuenta_Clean'] = df_sap[col_sap_cuenta].astype(str).str.strip()
             df_sap['Marca_Cuenta_SAP'] = df_sap['Cuenta_Clean'].map(BRAND_ACCOUNTS).fillna("OTRA / DESCONOCIDA")
-            
-            # errors='coerce' evita que el programa se rompa si hay una fecha mal escrita
             df_sap['Fecha_Clean'] = pd.to_datetime(df_sap[col_sap_fecha], errors='coerce').dt.date
             df_sap['Monto_SAP'] = pd.to_numeric(df_sap[col_sap_monto], errors='coerce').fillna(0)
 
             # -----------------------------------------------------------------
-            # LÓGICA DE CONCILIACIÓN (Cruces robustos)
+            # LÓGICA DE CONCILIACIÓN
             # -----------------------------------------------------------------
-            
             mp_grouped = df_mp.groupby('Ext_Ref_Clean').agg({
                 'Monto_MP': 'sum',
                 'Fecha_Clean': 'first',
@@ -174,9 +180,8 @@ if file_meli and file_mp and file_sap:
             df_master.rename(columns={'Fecha_Clean': 'Fecha_SAP'}, inplace=True)
 
             # -----------------------------------------------------------------
-            # VALIDACIONES REQUERIDAS
+            # VALIDACIONES
             # -----------------------------------------------------------------
-            
             df_master['Falta_En_SAP'] = df_master['Monto_SAP'].isna() | (df_master['Monto_SAP'] == 0)
             
             df_master['Diff_MELI_MP'] = (df_master['Monto_MELI'].fillna(0) - df_master['Monto_MP'].fillna(0)).round(2)
@@ -188,7 +193,6 @@ if file_meli and file_mp and file_sap:
                 if not pd.isna(row['Fecha_Clean_MELI']): fechas.append(row['Fecha_Clean_MELI'])
                 if not pd.isna(row['Fecha_Clean_MP']): fechas.append(row['Fecha_Clean_MP'])
                 if not pd.isna(row['Fecha_SAP']): fechas.append(row['Fecha_SAP'])
-                
                 if len(set(fechas)) > 1:
                     return "Descalce de Fecha"
                 return "OK"
@@ -213,7 +217,6 @@ if file_meli and file_mp and file_sap:
             # -----------------------------------------------------------------
             # VISUALIZACIÓN EN STREAMLIT
             # -----------------------------------------------------------------
-            
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total Packs Analizados", len(df_master))
             c2.metric("Faltantes en SAP (PR)", df_master['Falta_En_SAP'].sum())
@@ -261,11 +264,13 @@ if file_meli and file_mp and file_sap:
 
             with tab5:
                 st.subheader("Alertas de Fechas Descalzadas")
-                df_fechas_err = df_master[df_master['Control_Control_Fecha'] == "Descalce de Fecha" if 'Control_Control_Fecha' in df_master else df_master['Control_Fecha'] == "Descalce de Fecha"]
-                if not df_fechas_err.empty:
-                    st.dataframe(df_fechas_err[['Pack_ID_Clean', 'Fecha_Clean_MELI', 'Fecha_Clean_MP', 'Fecha_SAP']])
-                else:
-                    st.info("No se encontraron descalces de días entre las plataformas.")
+                col_fecha = 'Control_Fecha'
+                if col_fecha in df_master.columns:
+                    df_fechas_err = df_master[df_master[col_fecha] == "Descalce de Fecha"]
+                    if not df_fechas_err.empty:
+                        st.dataframe(df_fechas_err[['Pack_ID_Clean', 'Fecha_Clean_MELI', 'Fecha_Clean_MP', 'Fecha_SAP']])
+                    else:
+                        st.info("No se encontraron descalces de días entre las plataformas.")
                 
                 st.subheader("Posibles Duplicados en Bases Origen")
                 if not dup_sap.empty:
